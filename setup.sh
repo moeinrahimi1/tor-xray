@@ -5,6 +5,39 @@ UUID="4700dbf2-df05-4913-80ae-da9fec9e0da7"
 
 echo "=== Tor + Xray + obfs4 Interactive Setup ==="
 
+
+CONFIG_MARKER="/usr/local/etc/xray/config.json"
+TOR_MARKER="/etc/tor/torrc"
+
+# -------------------------
+# Detect existing setup
+# -------------------------
+if [[ -f "$CONFIG_MARKER" && -f "$TOR_MARKER" ]]; then
+  echo "[!] Existing Tor + Xray config detected."
+
+  read -p "Show VLESS URI and exit? (y/N): " CHOICE
+  CHOICE=${CHOICE,,}
+
+  if [[ "$CHOICE" == "y" ]]; then
+    SERVER_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}')
+    XRAY_PORT=$(jq -r '.inbounds[0].port' "$CONFIG_MARKER" 2>/dev/null || echo 8443)
+
+    VLESS_URI="vless://${UUID}@${SERVER_IP}:${XRAY_PORT}?encryption=none&type=tcp#tor-xray"
+    echo ""
+    echo "======================================"
+    echo " VLESS URI:"
+    echo "$VLESS_URI"
+    echo "======================================"
+    exit 0
+  fi
+
+  echo "[*] Re-running setup from scratch..."
+fi
+
+
+
+
+
 # -------------------------
 # Dependency checker
 # -------------------------
@@ -38,10 +71,20 @@ XRAY_PORT=${XRAY_PORT:-8443}
 read -p "Enter Tor ExitNode country code (e.g. de, nl, us): " TOR_COUNTRY
 TOR_COUNTRY=${TOR_COUNTRY:-de}
 
+echo ""
+echo "Enter Tor obfs4 bridges (one per line)."
+echo "When done, press ENTER on an empty line:"
+BRIDGES=()
+while true; do
+  read -r LINE
+  [[ -z "$LINE" ]] && break
+  BRIDGES+=("$LINE")
+done
+
 # -------------------------
 # Install dependencies
 # -------------------------
-install_if_missing tor obfs4proxy curl wget gnupg2 lsb-release
+install_if_missing tor obfs4proxy curl wget gnupg2 lsb-release jq
 
 # -------------------------
 # Install Xray if missing
@@ -58,19 +101,16 @@ fi
 # -------------------------
 echo "[*] Writing Tor config..."
 
-sudo tee /etc/tor/torrc <<EOF
+TORRC=$(mktemp)
+
+cat > "$TORRC" <<EOF
 SocksPort 9050
 
-# Exit node preference
 ExitNodes {$TOR_COUNTRY}
-StrictNodes 1
+StrictNodes 0
 
-# Bridges
 UseBridges 1
 ClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy
-
-Bridge obfs4 83.113.75.134:12345 8545E750001414D1C03307D21BACA22323ECA7D3 cert=KApm8jSi61HBvG2yDOES041iA1ZY+4l5Zr48WIk5AX1xb96a7ZU7kynqIGvW8oc/alnFbw iat-mode=0
-Bridge obfs4 65.108.148.241:9101 026F343E5CC9218C24D98FBBB26C6B4FA8CB9F3C cert=iytfhTD2yqW0hUk7z2uts7lZ24lmcBH9P5fv0CDNG9Go/ulbyim/+Woj3G0okW4OK0lMCQ iat-mode=0
 
 # Performance tuning
 MaxCircuitDirtiness 3600
@@ -78,7 +118,15 @@ ConnLimit 4096
 CircuitStreamTimeout 60
 ClientUseIPv6 0
 NumEntryGuards 1
+
 EOF
+
+# Append bridges
+for B in "${BRIDGES[@]}"; do
+  echo "Bridge $B" >> "$TORRC"
+done
+
+sudo mv "$TORRC" /etc/tor/torrc
 
 sudo systemctl restart tor
 sudo systemctl enable tor
@@ -91,9 +139,7 @@ sudo mkdir -p /usr/local/etc/xray
 
 sudo tee /usr/local/etc/xray/config.json <<EOF
 {
-  "log": {
-    "loglevel": "debug"
-  },
+  "log": { "loglevel": "debug" },
   "inbounds": [
     {
       "tag": "vless-in",
@@ -101,12 +147,7 @@ sudo tee /usr/local/etc/xray/config.json <<EOF
       "port": $XRAY_PORT,
       "protocol": "vless",
       "settings": {
-        "clients": [
-          {
-            "id": "$UUID",
-            "flow": ""
-          }
-        ],
+        "clients": [{ "id": "$UUID", "flow": "" }],
         "decryption": "none"
       },
       "streamSettings": {
@@ -118,28 +159,14 @@ sudo tee /usr/local/etc/xray/config.json <<EOF
   "outbounds": [
     {
       "protocol": "socks",
-      "settings": {
-        "servers": [
-          {
-            "address": "127.0.0.1",
-            "port": 9050
-          }
-        ]
-      },
+      "settings": { "servers": [{ "address": "127.0.0.1", "port": 9050 }] },
       "tag": "tor"
     },
-    {
-      "protocol": "freedom",
-      "tag": "direct"
-    }
+    { "protocol": "freedom", "tag": "direct" }
   ],
   "routing": {
     "rules": [
-      {
-        "type": "field",
-        "inboundTag": ["vless-in"],
-        "outboundTag": "tor"
-      }
+      { "type": "field", "inboundTag": ["vless-in"], "outboundTag": "tor" }
     ]
   }
 }
@@ -149,7 +176,7 @@ sudo systemctl restart xray
 sudo systemctl enable xray
 
 # -------------------------
-# Detect server IP using ip ONLY
+# Detect server IP
 # -------------------------
 SERVER_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}')
 if [ -z "$SERVER_IP" ]; then
@@ -177,7 +204,21 @@ echo "VLESS URI:"
 echo "$VLESS_URI"
 echo "======================================"
 
-# Test Tor IP
-echo "[*] Tor exit IP test:"
-curl --socks5 127.0.0.1:9050 https://api.ipify.org || true
+# -------------------------
+# Wait for Tor bootstrap
+# -------------------------
+# -------------------------
+# Wait fixed time for Tor
+# -------------------------
+echo "[*] Waiting 15 seconds for Tor to stabilize..."
+sleep 15
+
+# -------------------------
+# Test Tor IP with timeout
+# -------------------------
+echo "[*] Tor exit IP test (timeout 10s):"
+curl --socks5 127.0.0.1:9050 \
+     --connect-timeout 5 \
+     --max-time 10 \
+     https://api.ipify.org || echo "[!] Curl failed or timed out"
 echo
